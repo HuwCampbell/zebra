@@ -29,16 +29,16 @@ mergeLists gcEvery blocks0 = do
   blockRef <- liftIO $ Ref.newIORef blocks0
   entityRef <- liftIO $ Ref.newIORef []
   let pull ix = do
-      blocks <- liftIO $ Ref.readIORef blockRef
-      case headIx blocks ix of
-        Nothing -> return Nothing
-        Just (b,blocks') -> do
-          liftIO $ Ref.writeIORef blockRef blocks'
-          return (Just b)
+        blocks <- liftIO $ Ref.readIORef blockRef
+        case headIx blocks ix of
+          Nothing -> return Nothing
+          Just (b,blocks') -> do
+            liftIO $ Ref.writeIORef blockRef blocks'
+            return (Just b)
   let push e = do
-      e' <- entityOfForeign e
-      entities <- liftIO $ Ref.readIORef entityRef
-      liftIO $ Ref.writeIORef entityRef (e' : entities)
+        e' <- entityOfForeign e
+        entities <- liftIO $ Ref.readIORef entityRef
+        liftIO $ Ref.writeIORef entityRef (e' : entities)
   let opts = MergeOptions pull push gcEvery
 
   let ixes = Boxed.enumFromN (0 :: Int) (length blocks0)

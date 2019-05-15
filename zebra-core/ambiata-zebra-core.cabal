@@ -1,5 +1,5 @@
 name:                  ambiata-zebra-core
-version:               0.0.1
+version:               0.0.2
 license:               BSD3
 author:                Ambiata <info@ambiata.com>
 maintainer:            Ambiata <info@ambiata.com>
@@ -7,7 +7,7 @@ copyright:             (c) 2015 Ambiata.
 synopsis:              zebra
 category:              System
 cabal-version:         >= 1.8
-build-type:            Custom
+build-type:            Simple
 description:           zebra
 
 library
@@ -29,8 +29,8 @@ library
                     , binary                          >= 0.7.2      && < 0.9
                     , bindings-DSL                    >= 1.0.0      && <= 1.0.23
                     , bytestring                      == 0.10.*
-                    , containers                      == 0.5.*
-                    , exceptions                      >= 0.6        && < 0.9
+                    , containers                      >= 0.5        && < 0.7
+                    , exceptions                      >= 0.6        && < 0.11
                     , ghc-prim                        >= 0.4        && < 0.6
                     , lens                            >= 4.7        && < 4.18
                     , mmorph                          == 1.0.*
@@ -39,10 +39,10 @@ library
                     , pretty-show                     == 1.6.*
                     , primitive                       == 0.6.*
                     , random                          == 1.1.*
-                    , resourcet                       == 1.1.*
+                    , resourcet                       >= 1.1        && < 1.3
                     , semigroups                      == 0.18.*
-                    , streaming                       >= 0.1        && < 0.3
-                    , streaming-bytestring            >= 0.1        && < 0.3
+                    , streaming
+                    , streaming-bytestring
                     , text                            == 1.2.*
                     , thyme                           == 0.3.*
                     , transformers                    == 0.5.*
@@ -153,6 +153,9 @@ library
   cc-options:
                        -std=c99 -O3 -ggdb -msse4.2 -Wall -Werror -Wuninitialized -Wno-unused-command-line-argument -DCABAL=1
 
+  ghc-prof-options:
+                    -fno-prof-count-entries -fno-prof-cafs -fno-prof-auto
+
 test-suite test
   type:
                     exitcode-stdio-1.0
@@ -161,7 +164,7 @@ test-suite test
                     test.hs
 
   ghc-options:
-                    -Wall -threaded -O2
+                    -Wall -threaded -O2 -rtsopts
 
   hs-source-dirs:
                     test
@@ -182,7 +185,7 @@ test-suite test
                     , containers
                     , exceptions
                     , pretty-show
-                    , QuickCheck
+                    , QuickCheck                      >= 2.8.2      && < 2.10
                     , quickcheck-instances
                     , semigroups
                     , text
@@ -191,6 +194,35 @@ test-suite test
                     , transformers
                     , vector
 
+  other-modules:
+                      Test.Zebra.Factset.Block
+                      Test.Zebra.Factset.Data
+                      Test.Zebra.Foreign.Block
+                      Test.Zebra.Foreign.Entity
+                      Test.Zebra.Foreign.Merge
+                      Test.Zebra.Foreign.Table
+                      Test.Zebra.Jack
+                      Test.Zebra.Merge.Entity
+                      Test.Zebra.Merge.Table
+                      Test.Zebra.Serial.Binary.Array
+                      Test.Zebra.Serial.Binary.Block
+                      Test.Zebra.Serial.Binary.File
+                      Test.Zebra.Serial.Binary.Header
+                      Test.Zebra.Serial.Binary.Logical
+                      Test.Zebra.Serial.Binary.Striped
+                      Test.Zebra.Serial.Binary.Table
+                      Test.Zebra.Serial.Json.Logical
+                      Test.Zebra.Serial.Json.Schema
+                      Test.Zebra.Serial.Json.Striped
+                      Test.Zebra.Serial.Json.Util
+                      Test.Zebra.Serial.Text.Logical
+                      Test.Zebra.Serial.Text.Schema
+                      Test.Zebra.Serial.Text.Striped
+                      Test.Zebra.Table.Logical
+                      Test.Zebra.Table.Striped
+                      Test.Zebra.Time
+                      Test.Zebra.Util
+                      
 test-suite test-io
   type:
                     exitcode-stdio-1.0
@@ -212,5 +244,5 @@ test-suite test-io
                     , ambiata-p
                     , ambiata-zebra-core
                     , text
-                    , QuickCheck
+                    , QuickCheck                      >= 2.8.2      && < 2.10
                     , quickcheck-instances

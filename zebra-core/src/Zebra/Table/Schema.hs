@@ -118,7 +118,9 @@ data SchemaUnionError =
   | SchemaUnionFailedLookupInternalError !(Field Column)
   | SchemaUnionTableMismatch !Table !Table
   | SchemaUnionColumnMismatch !Column !Column
-    deriving (Eq, Show)
+    deriving (Eq, Show, Generic)
+
+instance NFData SchemaUnionError
 
 renderSchemaError :: SchemaError -> Text
 renderSchemaError = \case

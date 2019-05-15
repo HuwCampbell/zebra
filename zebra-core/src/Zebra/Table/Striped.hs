@@ -20,6 +20,7 @@ module Zebra.Table.Striped (
 
   -- * Summary
   , length
+  , lengthColumn
 
   , schema
   , schemaColumn
@@ -68,6 +69,9 @@ module Zebra.Table.Striped (
 
   -- * Streaming
   , rechunk
+  
+  -- debugging
+  , renderTableInfo
   ) where
 
 import           Control.Monad.Trans.Class (lift)
@@ -143,8 +147,24 @@ data StripedError =
   | StripedAppendColumnMismatch !Schema.Column !Schema.Column
   | StripedAppendVariantMismatch !(Variant Schema.Column) !(Variant Schema.Column)
   | StripedAppendFieldMismatch !(Field Schema.Column) !(Field Schema.Column)
-    deriving (Eq, Show)
+    deriving (Eq, Show, Generic)
 
+-- instance NFData StripedError
+
+renderTableInfo :: Table -> Text
+renderTableInfo = \case
+  Binary d eb bs -> "Binary(default=" <> tShow d <> " eb=" <> tShow eb <> " bs-len=" <> tShow (ByteString.length bs) <> ")"
+  Array d c1 -> "Array(default=" <> tShow d <> " col1=" <> renderColumnInfo c1 <> ")"
+  Map d c1 c2 -> "Map(default=" <> tShow d <> " col1=" <> renderColumnInfo c1 <> " col2=" <> renderColumnInfo c2 <> ")"
+
+tShow :: Show a => a -> Text
+tShow a = Text.pack $ show a
+
+renderColumnInfo :: Column -> Text
+renderColumnInfo = \case
+  Int d e v -> "Col[default=" <> tShow d <> " e=" <> tShow e <> " v-len=" <> tShow (Storable.length v) <> "]"
+  _ -> "" -- TODO
+  
 renderStripedError :: StripedError -> Text
 renderStripedError = \case
   StripedLogicalSchemaError err ->

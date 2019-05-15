@@ -49,14 +49,10 @@ module Zebra.Table.Logical (
   , mergeValue
   , mergeMap
   , mergeMaps
-
-  , UnionStep(..)
-  , unionStep
+  , mergeValues
 
   -- * Internal
   , renderField
-  , valid
-  , validValue
   ) where
 
 import           Data.ByteString (ByteString)
@@ -106,7 +102,9 @@ data LogicalMergeError =
   | LogicalCannotMergeInt !Int64 !Int64
   | LogicalCannotMergeDouble !Double !Double
   | LogicalCannotMergeEnum !(Tag, Value) !(Tag, Value)
-    deriving (Eq, Show)
+    deriving (Eq, Show, Generic)
+
+instance NFData LogicalMergeError
 
 data LogicalSchemaError =
     LogicalExpectedBinary !Table
@@ -118,7 +116,9 @@ data LogicalSchemaError =
   | LogicalExpectedStruct !Value
   | LogicalExpectedNested !Value
   | LogicalExpectedReversed !Value
-    deriving (Eq, Show)
+    deriving (Eq, Show, Generic)
+
+instance NFData LogicalSchemaError
 
 renderLogicalMergeError :: LogicalMergeError -> Text
 renderLogicalMergeError = \case
@@ -289,7 +289,6 @@ mergeMaps kvss =
 
     1 ->
       pure $ kvss Boxed.! 0
-
     2 ->
       mergeMap
         (kvss Boxed.! 0)
@@ -305,6 +304,28 @@ mergeMaps kvss =
 
       mergeMap kvs0 kvs1
 {-# INLINABLE mergeMaps #-}
+
+
+mergeValues :: Schema.Column -> Boxed.Vector Value -> Either LogicalMergeError Value
+mergeValues sc vss =
+  case Boxed.length vss of
+    0 ->
+      pure $ defaultValue sc
+    1 ->
+      pure $ vss Boxed.! 0
+    2 ->
+      mergeValue
+        (vss Boxed.! 0)
+        (vss Boxed.! 1)
+    n -> do
+      let
+        (vss0, vss1) =
+          Boxed.splitAt (n `div` 2) vss
+      vs0 <- mergeValues sc vss0
+      vs1 <- mergeValues sc vss1
+
+      mergeValue vs0 vs1
+{-# INLINABLE mergeValues #-}
 
 mergeValue :: Value -> Value -> Either LogicalMergeError Value
 mergeValue x0 x1 =
@@ -333,34 +354,6 @@ mergeValue x0 x1 =
     _ ->
       Left $ LogicalCannotMergeMismatchedValues x0 x1
 {-# INLINABLE mergeValue #-}
-
-------------------------------------------------------------------------
-
-data UnionStep =
-  UnionStep {
-      unionComplete :: !(Map Value Value)
-    , unionRemaining :: !(Cons Boxed.Vector (Map Value Value))
-    } deriving (Eq, Ord, Show)
-
-unionStep :: Value -> Cons Boxed.Vector (Map Value Value) -> Either LogicalMergeError UnionStep
-unionStep key kvss = do
-  let
-    (done0, done1, incomplete) =
-      Cons.unzip3 $ fmap (Map.splitLookup key) kvss
-
-    insert = \case
-      Nothing ->
-        id
-      Just x ->
-        Map.insert key x
-
-    dones =
-      Cons.zipWith insert done1 done0
-
-  done <- mergeMaps $ Cons.toVector dones
-
-  pure $ UnionStep done incomplete
-{-# INLINABLE unionStep #-}
 
 ------------------------------------------------------------------------
 
@@ -563,55 +556,4 @@ compareTag x y =
   else
     LT
 {-# INLINE compareTag #-}
-
-
-------------------------------------------------------------------------
-
-valid :: Table -> Bool
-valid = \case
-  Binary _ ->
-    True
-
-  Array xs ->
-    all validValue xs
-
-  Map kvs ->
-    let
-      -- Test to ensure the Data.Map is
-      -- internally consistent.
-      m = Map.valid kvs
-      k = all validValue $ Map.keys kvs
-      v = all validValue $ Map.elems kvs
-    in
-      and [m, k, v]
-
-{-# INLINABLE valid #-}
-
-validValue :: Value -> Bool
-validValue = \case
-  Unit ->
-    True
-
-  Int _ ->
-    True
-
-  Double _ ->
-    True
-
-  Enum _ v ->
-    validValue v
-
-  Struct fs ->
-    Cons.all validValue fs
-
-  Nested xs ->
-    valid xs
-
-  Reversed v ->
-    validValue v
-
-{-# INLINABLE validValue #-}
-
-------------------------------------------------------------------------
-
 

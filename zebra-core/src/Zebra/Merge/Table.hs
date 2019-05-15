@@ -1,31 +1,39 @@
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DoAndIfThenElse #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# OPTIONS_GHC -fno-warn-deprecations #-}
 module Zebra.Merge.Table (
     MaximumRowSize(..)
 
+  , MergeRowsPerBlock(..)
   , UnionTableError(..)
   , renderUnionTableError
 
-  , unionLogical
   , unionStriped
   , unionStripedWith
   ) where
 
 import           Control.Monad.Morph (hoist, squash)
 import           Control.Monad.Trans.Class (lift)
-import           Control.Monad.Trans.State.Strict (StateT, runStateT, modify')
 
-import           Data.Map (Map)
+import           Data.Text as Text
+import           Data.Maybe (fromJust)
 import qualified Data.Map.Strict as Map
 import qualified Data.Vector as Boxed
 
+import           GHC.Generics (Generic)
+
 import           P
 
-import           Viking (Stream, Of)
+import           Viking (Stream, Of(..))
 import qualified Viking.Stream as Stream
 
 import           X.Control.Monad.Trans.Either (EitherT, hoistEither, left)
@@ -36,47 +44,62 @@ import           Zebra.Table.Logical (LogicalSchemaError, LogicalMergeError)
 import qualified Zebra.Table.Logical as Logical
 import           Zebra.Table.Schema (SchemaUnionError)
 import qualified Zebra.Table.Schema as Schema
-import           Zebra.Table.Striped (StripedError)
 import qualified Zebra.Table.Striped as Striped
 
-
+ 
 newtype MaximumRowSize =
   MaximumRowSize {
       unMaximumRowSize :: Int64
     } deriving (Eq, Ord, Show)
 
-data Input m =
-  Input {
-      inputData :: !(Map Logical.Value Logical.Value)
-    , inputStream :: !(Maybe (Stream (Of Logical.Table) m ()))
-    }
+newtype MergeRowsPerBlock =
+  MergeRowsPerBlock {
+      unMergeRowsPerBlock :: Int
+    } deriving (Eq, Ord, Show)
+    
+data Row = 
+  Row {      
+      rowKey :: !Logical.Value
+    , rowValue :: Logical.Value
+  } deriving (Eq, Show, Generic)
 
-data Step m =
-  Step {
-      _stepComplete :: !(Map Logical.Value Logical.Value)
-    , _stepRemaining :: !(Cons Boxed.Vector (Input m))
-    }
+instance NFData Row
+
+instance Ord Row where
+  compare (Row k1 _) (Row k2 _) = 
+    compare k1 k2 
 
 data UnionTableError =
     UnionEmptyInput
-  | UnionStripedError !StripedError
+  | UnionStripedError Text
+  | UnionMergeError Text
   | UnionLogicalSchemaError !LogicalSchemaError
   | UnionLogicalMergeError !LogicalMergeError
   | UnionSchemaError !SchemaUnionError
-    deriving (Eq, Show)
+  | UnionBinaryStripedEncodeError Text
+  | UnionBinaryStripedDecodeError Text
+    deriving (Eq, Show, Generic)
+
+instance NFData UnionTableError
 
 renderUnionTableError :: UnionTableError -> Text
 renderUnionTableError = \case
   UnionEmptyInput ->
     "Cannot merge empty files"
   UnionStripedError err ->
-    Striped.renderStripedError err
+    err
+  UnionMergeError err ->
+    err
   UnionLogicalSchemaError err ->
     Logical.renderLogicalSchemaError err
   UnionLogicalMergeError err ->
     Logical.renderLogicalMergeError err
   UnionSchemaError err ->
     Schema.renderSchemaUnionError err
+  UnionBinaryStripedEncodeError err ->
+    "BinaryStripedEncodeError: " <> err
+  UnionBinaryStripedDecodeError err ->
+    "BinaryStripedDecodeError: " <> err
 
 ------------------------------------------------------------------------
 -- General
@@ -96,156 +119,189 @@ peekHead input = do
       pure (hd, Stream.cons hd tl)
 {-# INLINABLE peekHead #-}
 
-hasData :: Input m -> Bool
-hasData =
-  not . Map.null . inputData
-{-# INLINABLE hasData #-}
-
-replaceData :: Map Logical.Value Logical.Value -> Input m -> Input m
-replaceData values input =
-  input {
-      inputData =
-        values
-    }
-{-# INLINABLE replaceData #-}
-
-dropData :: Map Logical.Value a -> Input m -> Input m
-dropData drops input =
-  input {
-      inputData =
-        inputData input `Map.difference` drops
-    }
-{-# INLINABLE dropData #-}
-
-isClosed :: Input m -> Bool
-isClosed =
-  isNothing . inputStream
-{-# INLINABLE isClosed #-}
-
-closeStream :: Input m -> Input m
-closeStream input =
-  input {
-      inputStream =
-        Nothing
-    }
-{-# INLINABLE closeStream #-}
-
-updateInput ::
+streamStripedAsRows ::
      Monad m
-  => Input m
-  -> StateT (Map Logical.Value Int64) (EitherT UnionTableError m) (Input m)
-updateInput input =
-  case inputStream input of
-    Nothing ->
-      pure input
-    Just stream ->
-      if hasData input then
-        pure input
-      else do
-        e <- lift . lift $ Stream.next stream
-        case e of
-          Left () ->
-            pure $
-              closeStream input
+  => Int
+  -> Stream (Of Striped.Table) m ()
+  -> Stream (Of Row) (EitherT UnionTableError m) ()
+streamStripedAsRows _num stream =
+  Stream.map (uncurry Row) $
+    Stream.concat $
+    Stream.mapM (hoistEither . logicalPairs) $
+    hoist lift 
+      stream
+{-# INLINABLE streamStripedAsRows #-}
 
-          Right (table, remaining) -> do
-            values <- lift . firstT UnionLogicalSchemaError . hoistEither $ Logical.takeMap table
-            modify' $ Map.unionWith (+) (Map.map Logical.sizeValue values)
-            pure $ Input values (Just remaining)
-{-# INLINABLE updateInput #-}
-
-takeExcessiveValues :: Maybe MaximumRowSize -> Map Logical.Value Int64 -> Map Logical.Value Int64
-takeExcessiveValues = \case
-  Nothing ->
-    const Map.empty
-  Just size ->
-    Map.filter (> unMaximumRowSize size)
-{-# INLINABLE takeExcessiveValues #-}
-
-unionStep :: Monad m => Logical.Value -> Cons Boxed.Vector (Input m) -> EitherT UnionTableError m (Step m)
-unionStep key inputs = do
-  step <- firstT UnionLogicalMergeError . hoistEither . (Logical.unionStep key) $ fmap inputData inputs
-  pure $
-    Step
-      (Logical.unionComplete step)
-      (Cons.zipWith replaceData (Logical.unionRemaining step) inputs)
-{-# INLINABLE unionStep #-}
-
-maximumKey :: Map Logical.Value Logical.Value -> Maybe Logical.Value
-maximumKey kvs =
-  if Map.null kvs then
-    Nothing
-  else
-    pure . fst $ Map.findMax kvs
-{-# INLINABLE maximumKey #-}
-
-unionInput ::
+-- merge streams in a binary tree fashion
+mergeStreamsBinary ::
      Monad m
-  => Maybe MaximumRowSize
-  -> Cons Boxed.Vector (Input m)
-  -> Map Logical.Value Int64
-  -> Stream (Of Logical.Table) (EitherT UnionTableError m) ()
-unionInput msize inputs0 sizes0 = do
-  (inputs1, sizes1) <- lift $ runStateT (traverse updateInput inputs0) sizes0
-  unless (Cons.all isClosed inputs1) $ do
-    let
-      drops =
-        takeExcessiveValues msize sizes1
+  => Cons Boxed.Vector (Stream (Of Row) (EitherT UnionTableError m) ())
+  -> Stream (Of Row) (EitherT UnionTableError m) ()
+mergeStreamsBinary kvss =
+  case Cons.length kvss of
+    0 ->
+      pure mempty
 
-      inputs2 =
-        fmap (dropData drops) inputs1
+    1 ->
+      fromJust $ Cons.index 0 kvss
 
-      maximums =
-        Cons.mapMaybe (maximumKey . inputData) inputs1
+    2 -> do
+      let mergeS s1 s2 = remapStreamEnd $ Stream.merge s1 s2
+      Cons.foldl1 mergeS kvss
 
-    if Boxed.null maximums then
-      unionInput msize inputs2 sizes1
-    else do
-      Step values inputs3 <- lift $ unionStep (Boxed.minimum maximums) inputs2
+    n -> do
       let
-        unyieldedSizes
-          = sizes1 `Map.difference` values
+        (kvss0, kvss1) = Boxed.splitAt (n `div` 2) $ Cons.toVector kvss
+        kvs0 = mergeStreamsBinary $ Cons.unsafeFromVector kvss0
+        kvs1 = mergeStreamsBinary $ Cons.unsafeFromVector kvss1
+      mergeStreamsBinary $ Cons.from2 kvs0 kvs1
+{-# INLINABLE mergeStreamsBinary #-}
 
-      Stream.yield $ Logical.Map values
-      unionInput msize inputs3 unyieldedSizes
-{-# INLINABLE unionInput #-}
 
-unionLogical ::
+remapStreamEnd :: Monad m => Stream (Of t) m (r,r) -> Stream (Of t) m r
+remapStreamEnd s = 
+  s >>= (\(a,b) -> return $ seq b a)
+{-# INLINABLE remapStreamEnd #-}
+
+  
+isPastMaxRowSize :: Maybe MaximumRowSize -> Int64 -> Bool
+isPastMaxRowSize = \case
+  Nothing ->
+    const False
+  Just size ->
+    (> unMaximumRowSize size)
+{-# INLINABLE isPastMaxRowSize #-}
+
+
+unionInputGroupBy ::
      Monad m
   => Schema.Table
   -> Maybe MaximumRowSize
-  -> Cons Boxed.Vector (Stream (Of Logical.Table) m ())
-  -> Stream (Of Logical.Table) (EitherT UnionTableError m) ()
-unionLogical schema msize inputs = do
-  Stream.whenEmpty (Logical.empty schema) $
-    unionInput msize (fmap (Input Map.empty . Just) inputs) Map.empty
-{-# INLINABLE unionLogical #-}
+  -> Cons Boxed.Vector (Stream (Of Striped.Table) m ())
+  -> Stream (Of Row) (EitherT UnionTableError m) ()
+unionInputGroupBy schema msize inputs0 = do
+  let 
+    compKey :: Row -> Row -> Bool
+    compKey a b = (rowKey a) == (rowKey b)
+
+  Stream.mapMaybeM (hoistEither . mergeRows msize schema) $
+    Stream.filter (/= []) $
+    Stream.mapped Stream.toList $
+    Stream.groupBy compKey $
+    mergeStreamsBinary $
+    Cons.imap streamStripedAsRows inputs0
+
+
+mergeRows ::
+     Maybe MaximumRowSize
+  -> Schema.Table
+  -> [Row]
+  -> Either UnionTableError (Maybe Row)
+mergeRows msize (Schema.Map _ _ schemaC) rows@(x:_) = do
+  mergedVal <- first UnionLogicalMergeError $ 
+      Logical.mergeValues schemaC (Boxed.fromList $ fmap rowValue rows)
+  
+  -- doing sizing after we've already incurred the cost of merging entity faster than doing it for each unmerged value
+  if isPastMaxRowSize msize $ Logical.sizeValue mergedVal then
+    pure Nothing
+  else
+    pure $ Just $! Row (rowKey x) mergedVal
+mergeRows _ _ _ = pure Nothing
+{-# INLINABLE mergeRows #-}
+
 
 unionStripedWith ::
      Monad m
   => Schema.Table
   -> Maybe MaximumRowSize
+  -> MergeRowsPerBlock
   -> Cons Boxed.Vector (Stream (Of Striped.Table) m ())
   -> Stream (Of Striped.Table) (EitherT UnionTableError m) ()
-unionStripedWith schema msize inputs0 = do
+unionStripedWith schema msize blockRows inputs0 = do
   let
     fromStriped =
-      Stream.mapM (hoistEither . first UnionStripedError . Striped.toLogical) .
-      Stream.mapM (hoistEither . first UnionStripedError . Striped.transmute schema) .
+      splitTable blockRows . 
+      Stream.mapM (hoistEither . first (UnionStripedError . Striped.renderStripedError) . Striped.transmute schema) .
       hoist lift
-
-  hoist squash .
-    Stream.mapM (hoistEither . first UnionStripedError . Striped.fromLogical schema) $
-    unionLogical schema msize (fmap fromStriped inputs0)
+  
+  hoist squash $
+    Stream.mapM (hoistEither . first (UnionStripedError . Striped.renderStripedError) . Striped.fromLogical schema) $
+    Stream.whenEmpty (Logical.empty schema) $
+    chunkRows blockRows $
+    unionInputGroupBy schema msize (fmap fromStriped inputs0)
 {-# INLINABLE unionStripedWith #-}
+
 
 unionStriped ::
      Monad m
   => Maybe MaximumRowSize
+  -> MergeRowsPerBlock
   -> Cons Boxed.Vector (Stream (Of Striped.Table) m ())
   -> Stream (Of Striped.Table) (EitherT UnionTableError m) ()
-unionStriped msize inputs0 = do
+unionStriped msize blockRows inputs0 = do
   (heads, inputs1) <- fmap Cons.unzip . lift $ traverse peekHead inputs0
   schema <- lift . hoistEither . unionSchemas $ fmap Striped.schema heads
-  unionStripedWith schema msize inputs1
+  unionStripedWith schema msize blockRows inputs1
 {-# INLINABLE unionStriped #-}
+
+
+-- | groups together the rows as per chunksize and forms a logical table from them
+chunkRows ::
+     Monad m
+  => MergeRowsPerBlock
+  -> Stream (Of Row) (EitherT UnionTableError m) ()
+  -> Stream (Of Logical.Table) (EitherT UnionTableError m) ()
+chunkRows blockRows inputs =
+    Stream.map rowsToTable $
+      Stream.mapped Stream.toList $ 
+      Stream.chunksOf (unMergeRowsPerBlock blockRows)
+        inputs
+    where
+        rowsToTable rows = Logical.Map $! Map.fromDistinctAscList $ fmap (\(Row k v) -> (k, v)) rows
+{-# INLINABLE chunkRows #-}
+
+
+-- | split the source striped table for cases where it's chunk sizes are many times bigger than our output size
+-- notably ivory would do this
+splitTable ::
+     Monad m
+  => MergeRowsPerBlock
+  -> Stream (Of Striped.Table) m ()
+  -> Stream (Of Striped.Table) m ()
+splitTable (MergeRowsPerBlock 0) stream = stream
+splitTable blockRows stream = do
+  let
+    tupleToList ~(a,b) = [a,b]
+    chunkSize = unMergeRowsPerBlock blockRows * 2
+    splitTableAt t | Striped.length t == 0 = [t]
+    splitTableAt t = do
+      let chunks = (Striped.length t `div` chunkSize)
+      splitChunks chunks t
+    splitChunks n t = case n of
+      0 -> [t]
+      1 -> [t]
+      2 -> tupleToList $ Striped.splitAt chunkSize t
+      _ ->
+        uncurry (:) $ 
+          second (splitChunks (n - 1)) $ 
+          Striped.splitAt chunkSize t
+
+  Stream.concat $
+    Stream.map splitTableAt
+      stream
+{-# INLINABLE splitTable #-}
+
+-- | convert striped table to a vector of logical key,value pairs
+-- tries to be strict on the key, lazy on the value
+logicalPairs :: 
+     Striped.Table 
+  -> Either UnionTableError (Boxed.Vector (Logical.Value, Logical.Value))
+logicalPairs (Striped.Map _ k _) | Striped.lengthColumn k == 0 =
+  Right Boxed.empty
+logicalPairs (Striped.Map _ k v) = do
+  !ks <- first (UnionStripedError . Striped.renderStripedError) $ Striped.toValues k
+  vs <- first (UnionStripedError . Striped.renderStripedError) $ Striped.toValues v
+  pure $ Boxed.zip ks vs
+logicalPairs _ =
+  Left $ UnionMergeError "Table not a Striped.Map"
+{-# INLINABLE logicalPairs #-}

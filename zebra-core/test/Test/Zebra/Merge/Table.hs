@@ -1,5 +1,6 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# OPTIONS_GHC -fno-warn-deprecations #-}
 module Test.Zebra.Merge.Table where
 
 import           Data.Functor.Identity (runIdentity)
@@ -26,7 +27,7 @@ import           X.Control.Monad.Trans.Either (runEitherT)
 import           X.Data.Vector.Cons (Cons)
 import qualified X.Data.Vector.Cons as Cons
 
-import           Zebra.Merge.Table (UnionTableError(..))
+import           Zebra.Merge.Table (UnionTableError(..), MergeRowsPerBlock(..))
 import qualified Zebra.Merge.Table as Merge
 import qualified Zebra.Table.Schema as Schema
 import           Zebra.Table.Striped (StripedError(..))
@@ -73,7 +74,8 @@ jModSchema schema =
 unionSimple :: Cons Boxed.Vector (NonEmpty Striped.Table) -> Either String (Maybe Striped.Table)
 unionSimple xss0 =
   case Striped.merges =<< traverse Striped.merges (fmap Cons.fromNonEmpty xss0) of
-    Left (StripedLogicalMergeError _) ->
+    Left (StripedLogicalMergeError _e) ->
+--       pure $ P.trace ("StripedLogicalMergeError=" <> show e) Nothing
       pure Nothing
     Left err ->
       Left $ ppShow err
@@ -82,11 +84,16 @@ unionSimple xss0 =
 
 unionList ::
       Maybe Merge.MaximumRowSize
+   -> MergeRowsPerBlock
    -> Cons Boxed.Vector (NonEmpty Striped.Table)
    -> Either String (Maybe Striped.Table)
-unionList msize xss0 =
-  case runIdentity . runEitherT . Stream.toList . Merge.unionStriped msize $ fmap Stream.each xss0 of
-    Left (UnionLogicalMergeError _) ->
+unionList msize blockRows xss0 =
+  case runIdentity . runEitherT . Stream.toList . Merge.unionStriped msize blockRows $ fmap Stream.each xss0 of
+    Left (UnionLogicalMergeError _e) ->
+--       pure $ P.trace ("UnionLogicalMergeError=" <> show e) Nothing
+      pure Nothing
+    Left (UnionMergeError _e) ->
+--       pure $ P.trace ("UnionMergeError=" <> show e) Nothing
       pure Nothing
     Left err ->
       Left $ ppShow err
@@ -101,6 +108,11 @@ unionList msize xss0 =
             Right x ->
               pure $ pure x
 
+largeBlock :: MergeRowsPerBlock
+largeBlock = MergeRowsPerBlock 1024
+noMaxRows :: MergeRowsPerBlock
+noMaxRows = MergeRowsPerBlock 0
+
 prop_union_identity :: Property
 prop_union_identity =
   gamble jMapSchema $ \schema ->
@@ -114,11 +126,13 @@ prop_union_identity =
         Striped.unsafeConcat $
         Cons.fromNonEmpty file0
 
-    x <- first ppShow $ unionList Nothing files
-    pure $
-      Just (normalizeStriped file)
-      ===
-      fmap normalizeStriped x
+    x <- first ppShow $ unionList Nothing noMaxRows files
+    let 
+      l = Just(normalizeStriped file)
+      r = fmap normalizeStriped x
+    when (l /= r) 
+      (P.trace ("---- failed result = " <> ppShow l <> "\n---- expected result = " <> ppShow r <> "\n----") (Right ()))
+    pure $ l === r
 
 prop_union_files_same_schema :: Property
 prop_union_files_same_schema =
@@ -126,7 +140,7 @@ prop_union_files_same_schema =
   gamble (Cons.unsafeFromList <$> listOfN 1 10 (jFile schema)) $ \files ->
   either (flip counterexample False) id $ do
     x <- first ppShow $ unionSimple files
-    y <- first ppShow $ unionList Nothing files
+    y <- first ppShow $ unionList Nothing largeBlock files
     pure $
       fmap normalizeStriped x
       ===
@@ -137,9 +151,10 @@ prop_union_files_empty =
   gamble jMapSchema $ \schema ->
   gamble (Cons.unsafeFromList <$> listOfN 1 10 (jFile schema)) $ \files ->
   either (flip counterexample False) id $ do
-    x <- first ppShow $ unionList (Just (Merge.MaximumRowSize (-1))) files
+    x <- first ppShow $ unionSimple files
+    y <- first ppShow $ unionList (Just (Merge.MaximumRowSize (-1))) largeBlock files
     pure $
-      Just (Striped.empty schema) === x
+      isJust x ==> (Just (Striped.empty schema) === y)
 
 prop_union_files_diff_schema :: Property
 prop_union_files_diff_schema =
@@ -152,7 +167,7 @@ prop_union_files_diff_schema =
   gamble (traverse jFile schemas) $ \files ->
   either (flip counterexample False) id $ do
     x <- first ppShow $ unionSimple files
-    y <- first ppShow $ unionList Nothing files
+    y <- first ppShow $ unionList Nothing largeBlock files
     pure $
       fmap normalizeStriped x
       ===
@@ -164,13 +179,15 @@ prop_union_with_max_is_submap =
   gamble (Cons.unsafeFromList <$> listOfN 1 10 (jFile schema)) $ \files ->
   gamble (choose ((-1),100)) $ \msize ->
   either (flip counterexample False) property $ do
-    x0 <- first ppShow $ unionList (Just (Merge.MaximumRowSize msize)) files
+    x0 <- first ppShow $ unionList (Just (Merge.MaximumRowSize msize)) largeBlock files
     y0 <- first ppShow $ unionSimple files
     ok <- for (liftA2 (,) x0 y0) $ \(x1, y1) -> do
       x2 <- first ppShow . Logical.takeMap =<< first ppShow (Striped.toLogical x1)
       y2 <- first ppShow . Logical.takeMap =<< first ppShow (Striped.toLogical y1)
+      unless ((x2 `Map.isSubmapOf` y2)) $ do
+        traceM ("Failed with maps\n\tresult = " <> show x2 <> "\n\texpected = " <> show y2 <> "\n\tMax-size = " <> show msize <> "\n--------------")
       return $ x2 `Map.isSubmapOf` y2
-    return $ maybe True id ok
+    return $ fromMaybe True ok
 
 return []
 tests :: IO Bool

@@ -15,7 +15,7 @@ module Zebra.Command.Merge (
   , renderMergeError
   ) where
 
-import           Control.Monad.Catch (MonadCatch)
+import           Control.Monad.Catch (MonadCatch, MonadMask)
 import           Control.Monad.IO.Class (liftIO)
 import           Control.Monad.Morph (hoist)
 import           Control.Monad.Trans.Resource (MonadResource, ResourceT)
@@ -36,7 +36,7 @@ import           X.Control.Monad.Trans.Either (EitherT, firstJoin, hoistEither)
 import qualified X.Data.Vector.Cons as Cons
 
 import           Zebra.Command.Util
-import           Zebra.Merge.Table (UnionTableError)
+import           Zebra.Merge.Table (UnionTableError, MergeRowsPerBlock(..))
 import qualified Zebra.Merge.Table as Merge
 import           Zebra.Serial.Binary (BinaryStripedEncodeError, BinaryStripedDecodeError)
 import           Zebra.Serial.Binary (BinaryVersion(..))
@@ -56,11 +56,6 @@ data Merge =
     , mergeVersion :: !BinaryVersion
     , mergeRowsPerChunk :: !MergeRowsPerBlock
     , mergeMaximumRowSize :: !(Maybe MergeMaximumRowSize)
-    } deriving (Eq, Ord, Show)
-
-newtype MergeRowsPerBlock =
-  MergeRowsPerBlock {
-      unMergeRowsPerBlock :: Int
     } deriving (Eq, Ord, Show)
 
 newtype MergeMaximumRowSize =
@@ -109,7 +104,10 @@ readSchema = \case
     fmap Just . firstT MergeTextSchemaDecodeError . hoistEither $
       Text.decodeSchema schema
 
-zebraMerge :: (MonadResource m, MonadCatch m) => Merge -> EitherT MergeError m ()
+zebraMerge :: 
+     (MonadResource m, MonadMask m) 
+  => Merge 
+  -> EitherT MergeError m ()
 zebraMerge x = do
   mschema <- readSchema (mergeSchema x)
 
@@ -118,17 +116,18 @@ zebraMerge x = do
       fmap readStriped . Cons.fromNonEmpty $ mergeInputs x
 
     msize =
-      fmap (Merge.MaximumRowSize . unMergeMaximumRowSize) $ mergeMaximumRowSize x
+      Merge.MaximumRowSize . unMergeMaximumRowSize <$> mergeMaximumRowSize x
+
+    rowsPerBlock =
+      mergeRowsPerChunk x
 
     union =
       maybe Merge.unionStriped Merge.unionStripedWith mschema
-
+        
   firstJoin MergeIOError .
       writeFileOrStdout (mergeOutput x) .
     hoist (firstJoin MergeBinaryStripedEncodeError) .
       Binary.encodeStripedWith (mergeVersion x) .
-    hoist (firstJoin MergeStripedError) .
-      Striped.rechunk (unMergeRowsPerBlock $ mergeRowsPerChunk x) .
     hoist (firstJoin MergeUnionTableError) $
-      union msize inputs
+      union msize rowsPerBlock inputs
 {-# SPECIALIZE zebraMerge :: Merge -> EitherT MergeError (ResourceT IO) () #-}
